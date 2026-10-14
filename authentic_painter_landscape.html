@@ -1,0 +1,1267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Infinite Master Painter Landscape Scroll</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body, html {
+            width: 100%; height: 100%; overflow: hidden;
+            background: #181512;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, serif;
+        }
+        #viewport { display: block; width: 100vw; height: 100vh; }
+        .artist-hud {
+            position: absolute; bottom: 22px; left: 50%; transform: translateX(-50%);
+            display: flex; align-items: center; gap: 16px;
+            background: rgba(36, 30, 24, 0.90);
+            backdrop-filter: blur(14px);
+            -webkit-backdrop-filter: blur(14px);
+            padding: 9px 26px; border-radius: 40px;
+            border: 1px solid rgba(215, 190, 155, 0.28);
+            box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
+            color: #efe4d4; font-size: 13px; user-select: none;
+            z-index: 100;
+        }
+        .artist-hud button {
+            background: rgba(255, 245, 230, 0.10);
+            border: 1px solid rgba(215, 190, 155, 0.35);
+            color: #f7ede1; padding: 5px 15px; border-radius: 16px;
+            cursor: pointer; font-size: 12px; font-weight: 500;
+            outline: none; transition: all 0.2s;
+        }
+        .artist-hud button:hover {
+            background: rgba(255, 245, 230, 0.20);
+            border-color: rgba(235, 210, 175, 0.65);
+        }
+        .artist-hud label { display: flex; align-items: center; gap: 7px; font-weight: 500; }
+        .artist-hud input[type="range"] { accent-color: #d97706; width: 85px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <canvas id="viewport"></canvas>
+
+    <div class="artist-hud">
+        <button id="btnPause">Pause</button>
+        <button id="btnReset">Fresh Canvas</button>
+        <label>
+            Paint Speed:
+            <input type="range" id="rngSpeed" min="0.5" max="4.0" step="0.25" value="1.5">
+        </label>
+        <label>
+            Pigment Richness:
+            <input type="range" id="rngLead" min="0.6" max="1.5" step="0.05" value="1.05">
+        </label>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('viewport');
+        const ctx = canvas.getContext('2d');
+        const btnPause = document.getElementById('btnPause');
+        const btnReset = document.getElementById('btnReset');
+        const rngSpeed = document.getElementById('rngSpeed');
+        const rngLead = document.getElementById('rngLead');
+
+        let width = 0, height = 0;
+        let isRunning = true;
+        let drawSpeed = 1.5;
+        let pigmentRichness = 1.05;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+        // ==============================================================
+        // INFINITE DOUBLE-BUFFERED CHUNK SYSTEM (Aged Warm Silk / Paper)
+        // ==============================================================
+        const CHUNK_WIDTH = 1024;
+        let chunks = {};
+        let paperPattern = null;
+
+        function buildPaperTexture() {
+            const pCan = document.createElement('canvas');
+            pCan.width = 512; pCan.height = 512;
+            const pCtx = pCan.getContext('2d');
+
+            pCtx.fillStyle = '#e5dac3';
+            pCtx.fillRect(0, 0, 512, 512);
+
+            const img = pCtx.getImageData(0, 0, 512, 512);
+            const d = img.data;
+            for (let i = 0; i < d.length; i += 4) {
+                const x = (i / 4) % 512;
+                const y = Math.floor((i / 4) / 512);
+                const weave = (Math.sin(x * 1.1) + Math.sin(y * 1.1)) * 1.6;
+                const tooth = (Math.random() - 0.5) * 10 + weave;
+                d[i]   = Math.min(255, Math.max(0, d[i] + tooth));
+                d[i+1] = Math.min(255, Math.max(0, d[i+1] + tooth - 1));
+                d[i+2] = Math.min(255, Math.max(0, d[i+2] + tooth - 2));
+            }
+            pCtx.putImageData(img, 0, 0);
+
+            pCtx.strokeStyle = 'rgba(90, 70, 50, 0.04)';
+            pCtx.lineWidth = 0.7;
+            for (let j = 0; j < 60; j++) {
+                pCtx.beginPath();
+                let x = Math.random() * 512, y = Math.random() * 512;
+                pCtx.moveTo(x, y);
+                const angle = Math.random() * Math.PI * 2;
+                const len = 8 + Math.random() * 20;
+                pCtx.quadraticCurveTo(
+                    x + Math.cos(angle + 0.4) * len * 0.5,
+                    y + Math.sin(angle + 0.4) * len * 0.5,
+                    x + Math.cos(angle) * len,
+                    y + Math.sin(angle) * len
+                );
+                pCtx.stroke();
+            }
+
+            paperPattern = ctx.createPattern(pCan, 'repeat');
+        }
+
+        function getChunk(chunkIndex) {
+            if (!chunks[chunkIndex]) {
+                const c = document.createElement('canvas');
+                c.width = CHUNK_WIDTH;
+                c.height = height;
+                const cCtx = c.getContext('2d');
+                cCtx.fillStyle = paperPattern;
+                cCtx.fillRect(0, 0, CHUNK_WIDTH, height);
+
+                const topGrad = cCtx.createLinearGradient(0, 0, 0, height);
+                topGrad.addColorStop(0, 'rgba(165, 140, 110, 0.14)');
+                topGrad.addColorStop(0.20, 'rgba(229, 218, 195, 0)');
+                topGrad.addColorStop(0.86, 'rgba(229, 218, 195, 0)');
+                topGrad.addColorStop(1, 'rgba(145, 120, 90, 0.16)');
+                cCtx.fillStyle = topGrad;
+                cCtx.fillRect(0, 0, CHUNK_WIDTH, height);
+
+                chunks[chunkIndex] = c;
+            }
+            return chunks[chunkIndex];
+        }
+
+        function drawInWorld(minWX, maxWX, drawCallback) {
+            const cStart = Math.floor((minWX - 80) / CHUNK_WIDTH);
+            const cEnd   = Math.floor((maxWX + 80) / CHUNK_WIDTH);
+            for (let cIdx = cStart; cIdx <= cEnd; cIdx++) {
+                const c = getChunk(cIdx);
+                const cCtx = c.getContext('2d');
+                const ox = cIdx * CHUNK_WIDTH;
+                cCtx.save();
+                cCtx.translate(-ox, 0);
+                drawCallback(cCtx);
+                cCtx.restore();
+            }
+        }
+
+        // ==============================================================
+        // NOISE & PROCEDURAL FUNCTIONS
+        // ==============================================================
+        function hash(x) {
+            const n = Math.sin(x * 127.1 + 311.7) * 43758.5453123;
+            return n - Math.floor(n);
+        }
+
+        function smoothNoise(x) {
+            const i = Math.floor(x);
+            const f = x - i;
+            const u = f * f * (3.0 - 2.0 * f);
+            return hash(i) * (1.0 - u) + hash(i + 1.0) * u;
+        }
+
+        const PALETTE = {
+            inkDark:     [26, 22, 18],     // Deep Sumi Lampblack
+            inkMid:      [62, 54, 45],     // Medium Charcoal / Sepia Ink
+            inkLight:    [112, 102, 88],   // Diluted Wash Ink
+            ochreWarm:   [162, 120, 72],   // Raw Sienna / Warm Ochre
+            terracotta:  [152, 74, 50],    // Cinnabar / Venetian Red
+            slateBlue:   [86, 98, 106],    // Distant Indigo-Gray Wash
+            mineralJade: [76, 100, 78],    // Sage / Celadon Green
+            chalkWhite:  [250, 245, 235],  // Titanium White Gouache
+            goldLeaf:    [212, 165, 76]    // Warm Lantern / Highlight Gold
+        };
+
+        function rgbaStr(rgb, alpha) {
+            const a = Math.max(0, Math.min(1, alpha * pigmentRichness));
+            return `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${a.toFixed(3)})`;
+        }
+
+        // Multi-bristle calligraphic stroke along an array of world points [{x, y}]
+        function paintSplineStroke(pts, options = {}) {
+            if (pts.length < 2) return;
+            let minX = Infinity, maxX = -Infinity;
+            for (let i = 0; i < pts.length; i++) {
+                if (pts[i].x < minX) minX = pts[i].x;
+                if (pts[i].x > maxX) maxX = pts[i].x;
+            }
+
+            const baseW    = options.width || 1.6;
+            const rgb      = options.color || PALETTE.inkDark;
+            const alpha    = options.alpha !== undefined ? options.alpha : 0.78;
+            const isDry    = options.dry || false;
+            const hasBleed = options.bleed || false;
+            const bristles = options.bristles || (isDry ? 4 : 2);
+
+            drawInWorld(minX, maxX, (cCtx) => {
+                cCtx.lineCap = 'round';
+                cCtx.lineJoin = 'round';
+
+                if (hasBleed) {
+                    cCtx.strokeStyle = rgbaStr(rgb, alpha * 0.15);
+                    cCtx.lineWidth = baseW * 2.1;
+                    cCtx.beginPath();
+                    cCtx.moveTo(pts[0].x, pts[0].y);
+                    for (let i = 1; i < pts.length; i++) cCtx.lineTo(pts[i].x, pts[i].y);
+                    cCtx.stroke();
+                }
+
+                for (let i = 0; i < pts.length - 1; i++) {
+                    const t = i / (pts.length - 1);
+                    const env = Math.sin(t * Math.PI);
+                    cCtx.strokeStyle = rgbaStr(rgb, alpha * (0.60 + 0.40 * env));
+                    cCtx.lineWidth = Math.max(0.5, baseW * (0.40 + 0.65 * env));
+                    cCtx.beginPath();
+                    cCtx.moveTo(pts[i].x, pts[i].y);
+                    cCtx.lineTo(pts[i + 1].x, pts[i + 1].y);
+                    cCtx.stroke();
+                }
+
+                for (let b = 0; b < bristles; b++) {
+                    const bFrac = bristles === 1 ? 0 : (b / (bristles - 1) - 0.5);
+                    cCtx.strokeStyle = rgbaStr(rgb, alpha * (0.35 + Math.random() * 0.35));
+                    cCtx.lineWidth = Math.max(0.4, (baseW / bristles) * 0.85);
+                    cCtx.beginPath();
+                    let drawing = false;
+                    for (let i = 0; i < pts.length - 1; i++) {
+                        if (isDry && Math.random() < 0.28) {
+                            drawing = false;
+                            continue;
+                        }
+                        const dx = pts[i + 1].x - pts[i].x;
+                        const dy = pts[i + 1].y - pts[i].y;
+                        const len = Math.hypot(dx, dy) || 1;
+                        const nx = -dy / len;
+                        const ny =  dx / len;
+                        const env = Math.sin((i / (pts.length - 1)) * Math.PI);
+                        const offset = bFrac * baseW * (0.45 + 0.55 * env);
+                        const px = pts[i].x + nx * offset;
+                        const py = pts[i].y + ny * offset;
+                        if (!drawing) {
+                            cCtx.moveTo(px, py);
+                            drawing = true;
+                        } else {
+                            cCtx.lineTo(px, py);
+                        }
+                    }
+                    cCtx.stroke();
+                }
+            });
+        }
+
+        function paintStroke(x0, y0, x1, y1, options = {}) {
+            const curve = options.curve !== undefined ? options.curve : 0;
+            const dx = x1 - x0, dy = y1 - y0;
+            const len = Math.hypot(dx, dy) || 1;
+            const nx = -dy / len, ny = dx / len;
+            const midX = (x0 + x1) * 0.5 + nx * curve;
+            const midY = (y0 + y1) * 0.5 + ny * curve;
+            const pts = [
+                { x: x0, y: y0 },
+                { x: (x0 + midX) * 0.5, y: (y0 + midY) * 0.5 },
+                { x: midX, y: midY },
+                { x: (midX + x1) * 0.5, y: (midY + y1) * 0.5 },
+                { x: x1, y: y1 }
+            ];
+            paintSplineStroke(pts, options);
+        }
+
+        // ==============================================================
+        // 1. DISTANT MISTY HORIZON RANGES (Wide Rolling Horizon Silhouettes)
+        // ==============================================================
+        function paintDistantWashRange(cx, topY, rWidth, rHeight, seed) {
+            const leftX = cx - rWidth * 0.5;
+            const rightX = cx + rWidth * 0.5;
+            const baseY = topY + rHeight;
+
+            drawInWorld(leftX, rightX, (cCtx) => {
+                cCtx.beginPath();
+                cCtx.moveTo(leftX, baseY);
+                const steps = 48;
+                for (let i = 0; i <= steps; i++) {
+                    const t = i / steps;
+                    const x = leftX + rWidth * t;
+                    // Gentle, sprawling horizontal mountain range silhouette
+                    const env = Math.sin(t * Math.PI);
+                    const subPeaks = 0.60 + 0.25 * Math.sin(t * Math.PI * 2.5 + seed) + 0.15 * smoothNoise(seed + t * 5.0);
+                    const y = baseY - rHeight * Math.pow(env, 0.85) * subPeaks;
+                    cCtx.lineTo(x, y);
+                }
+                cCtx.lineTo(rightX, baseY);
+                cCtx.closePath();
+
+                const grad = cCtx.createLinearGradient(cx, topY, cx, baseY);
+                grad.addColorStop(0, rgbaStr(PALETTE.inkLight, 0.35));
+                grad.addColorStop(0.60, rgbaStr(PALETTE.inkLight, 0.18));
+                grad.addColorStop(1, 'rgba(229, 218, 195, 0)');
+                cCtx.fillStyle = grad;
+                cCtx.fill();
+            });
+        }
+
+        // ==============================================================
+        // 2. MIDGROUND CONIFER WOODS (Dense Misty Groves in Mountain Valleys)
+        // ==============================================================
+        function paintMidgroundConiferWood(cx, baseY, widthSpan, treeCount, seed) {
+            drawInWorld(cx - widthSpan, cx + widthSpan, (cCtx) => {
+                cCtx.lineCap = 'round';
+
+                const wash = cCtx.createRadialGradient(cx, baseY, 4, cx, baseY, widthSpan * 0.65);
+                wash.addColorStop(0, rgbaStr(PALETTE.inkMid, 0.24));
+                wash.addColorStop(1, 'rgba(229, 218, 195, 0)');
+                cCtx.fillStyle = wash;
+                cCtx.beginPath();
+                cCtx.ellipse(cx, baseY, widthSpan * 0.65, 13, 0, 0, Math.PI * 2);
+                cCtx.fill();
+
+                for (let t = 0; t < treeCount; t++) {
+                    const frac = (t / (treeCount - 1)) - 0.5;
+                    const tx = cx + frac * widthSpan + (hash(seed + t * 3.1) - 0.5) * 9;
+                    const ty = baseY + (hash(seed * 2 + t) - 0.5) * 8 - Math.cos(frac * Math.PI) * 5;
+                    const th = 13 + hash(seed * 3 + t) * 16 * Math.cos(frac * 1.1);
+
+                    cCtx.strokeStyle = rgbaStr(PALETTE.inkDark, 0.78);
+                    cCtx.lineWidth = 1.05;
+                    cCtx.beginPath();
+                    cCtx.moveTo(tx, ty);
+                    cCtx.lineTo(tx, ty - th);
+                    cCtx.stroke();
+
+                    const tiers = 4 + Math.floor(hash(seed + t) * 3);
+                    for (let k = 1; k <= tiers; k++) {
+                        const ky = ty - th * (0.28 + 0.72 * (k / tiers));
+                        const kw = (1.1 - (k / tiers) * 0.65) * 6.2;
+                        cCtx.fillStyle = rgbaStr(k % 2 === 0 ? PALETTE.inkDark : PALETTE.inkMid, 0.74);
+                        cCtx.beginPath();
+                        cCtx.ellipse(tx + (hash(t + k) - 0.5) * 1.5, ky, kw, 1.7, 0, 0, Math.PI * 2);
+                        cCtx.fill();
+                    }
+                }
+            });
+        }
+
+        // ==============================================================
+        // 3. REALISTIC BROAD MOUNTAIN MASSIFS (Wide Base, Diagonal Ridges & Pima Cun)
+        // Replaces narrow pillars with sprawling, realistic geological massifs:
+        // - Base width is 2.5x to 3.5x the height (600px–950px wide!)
+        // - Concave flaring foothills & asymmetric multi-peaked ridgelines
+        // - Diagonal structural ridge spines dividing sunlit & shaded faces
+        // - Flowing diagonal hemp-fiber strokes (Pima Cun) following slope angles
+        // ==============================================================
+        function paintRealisticMountainMassif(cx, peakY, mWidth, mHeight, seed, tintRGB) {
+            const baseY = peakY + mHeight;
+            const leftX = cx - mWidth * 0.52;
+            const rightX = cx + mWidth * 0.52;
+
+            // Asymmetric main summit + 2 flanking sub-peaks / shoulders
+            const mainU = (hash(seed * 3.7) - 0.5) * 0.24; // -0.12 to +0.12
+            const leftShoulderU  = mainU - (0.26 + hash(seed * 5.1) * 0.14);
+            const rightShoulderU = mainU + (0.26 + hash(seed * 7.9) * 0.14);
+            const leftShoulderH  = 0.52 + hash(seed * 2.3) * 0.22;
+            const rightShoulderH = 0.48 + hash(seed * 4.7) * 0.24;
+
+            const steps = 48;
+            const ridgePts = [];
+
+            for (let i = 0; i <= steps; i++) {
+                const t = i / steps;
+                const u = t * 2 - 1; // -1 to +1 across the wide base
+
+                // Smooth window that tapers to 0 at u = -1 and u = +1 with gentle concave skirts
+                const windowEnv = Math.pow(Math.sin(t * Math.PI), 1.45);
+
+                // Sum of 3 overlapping broad Gaussian bells (main peak + left shoulder + right shoulder)
+                const gMain  = Math.exp(-Math.pow((u - mainU) / 0.34, 2));
+                const gLeft  = leftShoulderH  * Math.exp(-Math.pow((u - leftShoulderU) / 0.32, 2));
+                const gRight = rightShoulderH * Math.exp(-Math.pow((u - rightShoulderU) / 0.32, 2));
+
+                // Combine peaks smoothly with organic rocky undulation
+                const combined = Math.max(gMain, gLeft * 0.92, gRight * 0.92) * 0.72 + (gMain + gLeft * 0.45 + gRight * 0.45) * 0.28;
+                const cragNoise = (smoothNoise(seed * 6.1 + t * 9.0) - 0.5) * 0.055;
+                const elevFrac = Math.max(0, Math.min(1.02, (combined + cragNoise) * windowEnv));
+
+                const x = cx + u * (mWidth * 0.5);
+                const y = baseY - elevFrac * mHeight;
+                ridgePts.push({ x, y, u, t, elevFrac });
+            }
+
+            // Locate the actual summit point & shoulder points for internal ridge spines
+            let mainIdx = Math.floor((mainU + 1) * 0.5 * steps);
+            let leftShIdx = Math.floor((leftShoulderU + 1) * 0.5 * steps);
+            let rightShIdx = Math.floor((rightShoulderU + 1) * 0.5 * steps);
+            mainIdx = Math.max(6, Math.min(steps - 6, mainIdx));
+            leftShIdx = Math.max(4, Math.min(steps - 4, leftShIdx));
+            rightShIdx = Math.max(4, Math.min(steps - 4, rightShIdx));
+
+            drawInWorld(leftX - 30, rightX + 30, (cCtx) => {
+                // Pass 1: Opaque Paper Occlusion + Soft Mineral & Ink Under-Wash
+                cCtx.beginPath();
+                cCtx.moveTo(ridgePts[0].x, baseY + 12);
+                for (let i = 0; i <= steps; i++) cCtx.lineTo(ridgePts[i].x, ridgePts[i].y);
+                cCtx.lineTo(ridgePts[steps].x, baseY + 12);
+                cCtx.closePath();
+
+                const bodyGrad = cCtx.createLinearGradient(cx, peakY, cx, baseY + 12);
+                bodyGrad.addColorStop(0, 'rgba(229, 218, 195, 0.98)');
+                bodyGrad.addColorStop(0.76, 'rgba(229, 218, 195, 0.93)');
+                bodyGrad.addColorStop(1, 'rgba(229, 218, 195, 0)');
+                cCtx.fillStyle = bodyGrad;
+                cCtx.fill();
+
+                const washGrad = cCtx.createLinearGradient(leftX, peakY, rightX, baseY);
+                washGrad.addColorStop(0, rgbaStr(PALETTE.inkMid, 0.19));
+                washGrad.addColorStop(0.48, rgbaStr(tintRGB || PALETTE.ochreWarm, 0.12));
+                washGrad.addColorStop(1, 'rgba(229, 218, 195, 0)');
+                cCtx.fillStyle = washGrad;
+                cCtx.fill();
+
+                cCtx.save();
+                cCtx.clip();
+
+                // Pass 2: Diagonal Structural Ridge Spines & Draped Pima Cun (Hemp-Fiber Strokes)
+                // Helper to draw a 3D mountain facet lobe descending from a ridge point
+                function drawFacetFlank(apexIdx, baseCenterX, flankWidth, numDrapeStrokes, lobeSeed) {
+                    const apex = ridgePts[apexIdx];
+
+                    // Soft shadow wash along the left (shaded) crease of this facet
+                    const shGrad = cCtx.createLinearGradient(apex.x - flankWidth * 0.45, apex.y, apex.x + flankWidth * 0.15, baseY);
+                    shGrad.addColorStop(0, rgbaStr(PALETTE.inkMid, 0.16));
+                    shGrad.addColorStop(1, 'rgba(229, 218, 195, 0)');
+                    cCtx.fillStyle = shGrad;
+                    cCtx.beginPath();
+                    cCtx.moveTo(apex.x, apex.y);
+                    cCtx.quadraticCurveTo(
+                        (apex.x + baseCenterX) * 0.5 - flankWidth * 0.28,
+                        (apex.y + baseY) * 0.5,
+                        baseCenterX - flankWidth * 0.55,
+                        baseY
+                    );
+                    cCtx.lineTo(baseCenterX + flankWidth * 0.15, baseY);
+                    cCtx.closePath();
+                    cCtx.fill();
+
+                    // Diagonal structural spine line descending from apex to baseCenterX
+                    const spineSteps = 14;
+                    const spinePts = [];
+                    for (let s = 0; s <= spineSteps; s++) {
+                        const st = s / spineSteps;
+                        const sx = apex.x + (baseCenterX - apex.x) * Math.pow(st, 0.92) + Math.sin(st * Math.PI * 2 + lobeSeed) * 9;
+                        const sy = apex.y + (baseY - apex.y) * st;
+                        spinePts.push({ x: sx, y: sy });
+                    }
+
+                    cCtx.strokeStyle = rgbaStr(PALETTE.inkDark, 0.62);
+                    cCtx.lineWidth = 1.25;
+                    cCtx.beginPath();
+                    cCtx.moveTo(spinePts[0].x, spinePts[0].y);
+                    for (let s = 1; s <= spineSteps; s++) cCtx.lineTo(spinePts[s].x, spinePts[s].y);
+                    cCtx.stroke();
+
+                    // Flowing Diagonal Hemp-Fiber Contours (Pima Cun) fanning out on both sides of the spine!
+                    for (let r = 1; r <= numDrapeStrokes; r++) {
+                        const frac = r / (numDrapeStrokes + 1);
+                        const startS = Math.floor(frac * 4);
+
+                        // Left-flank diagonal contour strokes (denser, darker ink)
+                        cCtx.strokeStyle = rgbaStr(r % 2 === 0 ? PALETTE.inkDark : PALETTE.inkMid, 0.28 + (1 - frac) * 0.28);
+                        cCtx.lineWidth = 0.65 + (1 - frac) * 0.55;
+                        cCtx.beginPath();
+                        for (let s = startS; s <= spineSteps; s++) {
+                            const st = s / spineSteps;
+                            // Flare wider as the stroke descends toward the mountain foot
+                            const spread = flankWidth * 0.58 * frac * (0.35 + 0.65 * Math.pow(st, 0.85));
+                            const wave = Math.sin(st * 7.0 + r * 1.3 + lobeSeed) * 3.5;
+                            const px = spinePts[s].x - spread + wave;
+                            const py = spinePts[s].y + frac * 14 * (1 - st * 0.5);
+                            if (s === startS) cCtx.moveTo(px, py);
+                            else cCtx.lineTo(px, py);
+                        }
+                        cCtx.stroke();
+
+                        // Right-flank diagonal contour strokes (lighter, airier with Liu Bai gaps)
+                        if (r % 3 !== 0) {
+                            cCtx.strokeStyle = rgbaStr(PALETTE.inkMid, 0.20 + (1 - frac) * 0.22);
+                            cCtx.lineWidth = 0.6 + (1 - frac) * 0.45;
+                            cCtx.beginPath();
+                            for (let s = startS + 1; s <= spineSteps; s++) {
+                                const st = s / spineSteps;
+                                const spread = flankWidth * 0.52 * frac * (0.35 + 0.65 * Math.pow(st, 0.85));
+                                const wave = Math.sin(st * 7.0 + r * 1.7 + lobeSeed) * 3.5;
+                                const px = spinePts[s].x + spread + wave;
+                                const py = spinePts[s].y + frac * 14 * (1 - st * 0.5);
+                                if (s === startS + 1) cCtx.moveTo(px, py);
+                                else cCtx.lineTo(px, py);
+                            }
+                            cCtx.stroke();
+                        }
+                    }
+                }
+
+                // Draw the flanking shoulder facets first, then the main central peak facet
+                drawFacetFlank(leftShIdx, ridgePts[leftShIdx].x - mWidth * 0.12, mWidth * 0.36, 9, seed + 11);
+                drawFacetFlank(rightShIdx, ridgePts[rightShIdx].x + mWidth * 0.12, mWidth * 0.36, 9, seed + 23);
+                drawFacetFlank(mainIdx, ridgePts[mainIdx].x + (hash(seed) - 0.5) * mWidth * 0.14, mWidth * 0.48, 13, seed + 37);
+
+                // Long sweeping horizontal/diagonal foothill contour lines at the base
+                cCtx.strokeStyle = rgbaStr(PALETTE.inkMid, 0.36);
+                cCtx.lineWidth = 0.8;
+                for (let b = 0; b < 5; b++) {
+                    const bx0 = leftX + mWidth * (0.08 + b * 0.15);
+                    const bx1 = bx0 + mWidth * (0.22 + hash(seed + b) * 0.12);
+                    const by0 = baseY - (28 - b * 4) + (hash(seed * 2 + b) - 0.5) * 10;
+                    const by1 = baseY - 2;
+                    cCtx.beginPath();
+                    cCtx.moveTo(bx0, by0);
+                    cCtx.quadraticCurveTo((bx0 + bx1) * 0.5, (by0 + by1) * 0.5 - 6, bx1, by1);
+                    cCtx.stroke();
+                }
+
+                cCtx.restore();
+            });
+
+            // Pass 3: Calligraphic Outer Ridge Contour
+            paintSplineStroke(ridgePts, { width: 1.8, color: PALETTE.inkDark, alpha: 0.86, dry: true });
+
+            // Pass 4: Summit & Ridge Shoulder Vegetation / Moss Dots (苔点 Taidian)
+            drawInWorld(leftX, rightX, (cCtx) => {
+                cCtx.lineCap = 'round';
+                for (let i = 4; i <= steps - 4; i++) {
+                    const pt = ridgePts[i];
+                    // Cluster moss/tree ticks naturally near local peaks and upper shoulders
+                    const nearPeak = (Math.abs(i - mainIdx) < 6) || (Math.abs(i - leftShIdx) < 5) || (Math.abs(i - rightShIdx) < 5);
+                    if ((nearPeak || pt.elevFrac > 0.48) && hash(seed * 5.3 + i) > 0.28) {
+                        const clusterCount = (nearPeak ? 3 : 1) + Math.floor(hash(seed + i * 2.1) * 3);
+                        for (let c = 0; c < clusterCount; c++) {
+                            const ox = pt.x + (hash(seed + i + c * 7.1) - 0.5) * 11;
+                            const oy = pt.y + (hash(seed * 2 + i + c) - 0.3) * 5;
+                            const tickH = 2.5 + hash(seed * 3 + i + c) * 4.5;
+
+                            cCtx.strokeStyle = rgbaStr(PALETTE.inkDark, 0.72 + hash(i + c) * 0.2);
+                            cCtx.lineWidth = 0.9 + hash(c) * 0.45;
+                            cCtx.beginPath();
+                            cCtx.moveTo(ox, oy);
+                            cCtx.lineTo(ox, oy - tickH);
+                            cCtx.stroke();
+
+                            cCtx.fillStyle = rgbaStr(PALETTE.inkDark, 0.75);
+                            cCtx.beginPath();
+                            cCtx.ellipse(ox, oy - tickH, 1.4, 0.9, 0, 0, Math.PI * 2);
+                            cCtx.fill();
+                        }
+                    }
+                }
+            });
+        }
+
+        // Paint a sprawling, multi-layered realistic mountain range
+        function paintMountainCluster(cx, basePeakY, clusterW, clusterH, seed) {
+            // 1. Distant/flanking secondary massif offset to the side
+            const sideDir = hash(seed * 1.9) > 0.5 ? 1 : -1;
+            paintRealisticMountainMassif(
+                cx - sideDir * clusterW * 0.24,
+                basePeakY + clusterH * 0.18,
+                clusterW * 0.78,
+                clusterH * 0.82,
+                seed + 11.3,
+                PALETTE.slateBlue
+            );
+
+            // 2. Primary sprawling mountain massif (wide base, multi-shouldered ridge)
+            paintRealisticMountainMassif(
+                cx,
+                basePeakY,
+                clusterW,
+                clusterH,
+                seed,
+                PALETTE.ochreWarm
+            );
+
+            // 3. Misty Conifer Woods nestled in the natural saddle/valley folds
+            paintMidgroundConiferWood(
+                cx - clusterW * 0.16,
+                basePeakY + clusterH * 0.56,
+                64,
+                10,
+                seed + 31.1
+            );
+            paintMidgroundConiferWood(
+                cx + clusterW * 0.18,
+                basePeakY + clusterH * 0.64,
+                56,
+                9,
+                seed + 47.8
+            );
+        }
+
+        // ==============================================================
+        // 4. ORGANIC ALUM-HEAD BOULDERS & SHORELINE SLOPES (矾头 Fantou)
+        // ==============================================================
+        function paintOrganicBoulder(bx, by, radX, radY, seed) {
+            const pts = [];
+            const steps = 16;
+            for (let i = 0; i <= steps; i++) {
+                const t = i / steps;
+                const ang = Math.PI + t * Math.PI;
+                const rMod = 0.82 + 0.28 * smoothNoise(seed + t * 4.5);
+                const x = bx + Math.cos(ang) * radX * rMod;
+                const y = by + Math.sin(ang) * radY * rMod;
+                pts.push({ x, y });
+            }
+
+            drawInWorld(bx - radX * 1.5, bx + radX * 1.5, (cCtx) => {
+                cCtx.fillStyle = '#e5dac3';
+                cCtx.beginPath();
+                cCtx.moveTo(pts[0].x, by + 4);
+                for (let i = 0; i <= steps; i++) cCtx.lineTo(pts[i].x, pts[i].y);
+                cCtx.lineTo(pts[steps].x, by + 4);
+                cCtx.closePath();
+                cCtx.fill();
+
+                const grad = cCtx.createLinearGradient(bx, by - radY, bx, by + 4);
+                grad.addColorStop(0, rgbaStr(PALETTE.ochreWarm, 0.18));
+                grad.addColorStop(1, 'rgba(229, 218, 195, 0)');
+                cCtx.fillStyle = grad;
+                cCtx.fill();
+
+                cCtx.strokeStyle = rgbaStr(PALETTE.inkMid, 0.50);
+                cCtx.lineWidth = 0.75;
+                for (let r = 1; r <= 3; r++) {
+                    const f = r / 4;
+                    cCtx.beginPath();
+                    for (let i = 2; i <= steps - 3; i++) {
+                        const px = bx + (pts[i].x - bx) * f;
+                        const py = by + (pts[i].y - by) * f;
+                        if (i === 2) cCtx.moveTo(px, py);
+                        else cCtx.lineTo(px, py);
+                    }
+                    cCtx.stroke();
+                }
+
+                cCtx.fillStyle = rgbaStr(PALETTE.inkDark, 0.72);
+                for (let i = 4; i <= steps - 4; i += 2) {
+                    if (hash(seed + i) > 0.35) {
+                        cCtx.beginPath();
+                        cCtx.arc(pts[i].x + (hash(i) - 0.5) * 2, pts[i].y - 1, 1.1, 0, Math.PI * 2);
+                        cCtx.fill();
+                    }
+                }
+            });
+
+            paintSplineStroke(pts, { width: 1.35, color: PALETTE.inkDark, alpha: 0.84, dry: true });
+        }
+
+        // ==============================================================
+        // 5. MASTER PAINTER TREES (Graceful Non-Crossing Postures)
+        // ==============================================================
+        function paintMasterPineTree(wx, wy, treeH, leanAmount, seed) {
+            const minX = wx - treeH * 1.1;
+            const maxX = wx + treeH * 1.1;
+
+            drawInWorld(minX, maxX, (cCtx) => {
+                cCtx.lineCap = 'round';
+                cCtx.lineJoin = 'round';
+
+                const b1x = wx + leanAmount * treeH * 0.14;
+                const b1y = wy - treeH * 0.45;
+                const b2x = wx + leanAmount * treeH * 0.32;
+                const b2y = wy - treeH * 0.78;
+                const tx  = wx + leanAmount * treeH * 0.46;
+                const ty  = wy - treeH;
+
+                cCtx.strokeStyle = rgbaStr(PALETTE.ochreWarm, 0.62);
+                cCtx.lineWidth = Math.max(2.4, treeH * 0.062);
+                cCtx.beginPath();
+                cCtx.moveTo(wx, wy);
+                cCtx.bezierCurveTo(b1x, b1y, b2x, b2y, tx, ty);
+                cCtx.stroke();
+
+                cCtx.strokeStyle = rgbaStr(PALETTE.inkDark, 0.92);
+                cCtx.lineWidth = 1.3;
+                [-1, 1].forEach(side => {
+                    const off = side * Math.max(1.1, treeH * 0.028);
+                    cCtx.beginPath();
+                    cCtx.moveTo(wx + off * 1.3, wy);
+                    cCtx.bezierCurveTo(b1x + off, b1y, b2x + off * 0.7, b2y, tx + off * 0.4, ty);
+                    cCtx.stroke();
+                });
+
+                const primaryDir = leanAmount >= 0 ? 1 : -1;
+                const branches = [
+                    { sx: b1x, sy: b1y, len: treeH * 0.38, dir: primaryDir, drop: 4 },
+                    { sx: b1x + (b2x - b1x) * 0.5, sy: b1y + (b2y - b1y) * 0.5, len: treeH * 0.32, dir: -primaryDir, drop: -2 },
+                    { sx: b2x, sy: b2y, len: treeH * 0.44, dir: primaryDir, drop: 6 },
+                    { sx: tx, sy: ty, len: treeH * 0.30, dir: primaryDir, drop: 2 }
+                ];
+
+                function drawConnectedFoliagePad(cx, cy, padW, padH, padSeed) {
+                    cCtx.fillStyle = rgbaStr(PALETTE.mineralJade, 0.26);
+                    cCtx.beginPath();
+                    cCtx.ellipse(cx, cy, padW * 0.9, padH * 0.85, 0, 0, Math.PI * 2);
+                    cCtx.fill();
+
+                    const numLayers = 13;
+                    for (let i = 0; i < numLayers; i++) {
+                        const ang = (i / numLayers) * Math.PI * 2;
+                        const rFrac = 0.22 + 0.65 * hash(padSeed + i * 3.7);
+                        const fx = cx + Math.cos(ang) * padW * rFrac;
+                        const fy = cy + Math.sin(ang) * padH * rFrac;
+
+                        if (i % 3 === 0) {
+                            cCtx.strokeStyle = rgbaStr(PALETTE.inkDark, 0.70);
+                            cCtx.lineWidth = 0.75;
+                            cCtx.beginPath();
+                            cCtx.moveTo(cx, cy + 2);
+                            cCtx.lineTo(fx, fy);
+                            cCtx.stroke();
+                        }
+
+                        const isDarkCore = rFrac < 0.6 || i % 2 === 0;
+                        cCtx.fillStyle = rgbaStr(isDarkCore ? PALETTE.inkDark : PALETTE.inkMid, isDarkCore ? 0.80 : 0.62);
+                        cCtx.beginPath();
+                        cCtx.ellipse(fx, fy, 4.5 + (i % 3), 2.0, (hash(padSeed + i) - 0.5) * 0.4, 0, Math.PI * 2);
+                        cCtx.fill();
+
+                        cCtx.strokeStyle = rgbaStr(PALETTE.inkDark, 0.82);
+                        cCtx.lineWidth = 0.62;
+                        for (let n = 0; n <= 5; n++) {
+                            const nAng = -Math.PI + (n / 5) * Math.PI;
+                            cCtx.beginPath();
+                            cCtx.moveTo(fx, fy + 1);
+                            cCtx.lineTo(fx + Math.cos(nAng) * 5.2, fy + Math.sin(nAng) * 4.0);
+                            cCtx.stroke();
+                        }
+                    }
+                }
+
+                branches.forEach((br, idx) => {
+                    const ex = br.sx + br.dir * br.len;
+                    const ey = br.sy + br.drop;
+                    const midBX = br.sx + (ex - br.sx) * 0.55;
+                    const midBY = br.sy - 3;
+
+                    cCtx.strokeStyle = rgbaStr(PALETTE.inkDark, 0.90);
+                    cCtx.lineWidth = Math.max(1.1, treeH * 0.034);
+                    cCtx.beginPath();
+                    cCtx.moveTo(br.sx, br.sy);
+                    cCtx.quadraticCurveTo(midBX, midBY, ex, ey);
+                    cCtx.stroke();
+
+                    drawConnectedFoliagePad(midBX, midBY - 2, 13 + idx * 1.5, 6.0, seed + idx * 11);
+                    drawConnectedFoliagePad(ex, ey - 2, 16 + idx * 1.8, 7.0, seed + idx * 23);
+                });
+
+                drawConnectedFoliagePad(tx, ty - 2, 18, 8.0, seed + 99);
+            });
+        }
+
+        function paintLeafyGroveTree(wx, wy, treeH, seed) {
+            drawInWorld(wx - treeH, wx + treeH, (cCtx) => {
+                cCtx.lineCap = 'round';
+                cCtx.strokeStyle = rgbaStr(PALETTE.inkDark, 0.88);
+
+                function branch(x, y, len, angle, depth) {
+                    if (depth > 4 || len < 3) return;
+                    const ex = x + Math.cos(angle) * len;
+                    const ey = y + Math.sin(angle) * len;
+                    cCtx.lineWidth = Math.max(0.75, (5 - depth) * 0.8);
+                    cCtx.beginPath();
+                    cCtx.moveTo(x, y);
+                    cCtx.lineTo(ex, ey);
+                    cCtx.stroke();
+
+                    if (depth >= 3) {
+                        for (let d = 0; d < 4; d++) {
+                            const dx = ex + (hash(seed + depth + d * 3.1) - 0.5) * 9;
+                            const dy = ey + (hash(seed * 2 + depth + d * 5.7) - 0.5) * 6;
+                            cCtx.fillStyle = rgbaStr(d === 0 ? PALETTE.ochreWarm : PALETTE.inkDark, d === 0 ? 0.45 : 0.72);
+                            cCtx.beginPath();
+                            cCtx.ellipse(dx, dy, 3.2, 1.8, (hash(d) - 0.5) * 0.6, 0, Math.PI * 2);
+                            cCtx.fill();
+                        }
+                    }
+
+                    const spread = 0.32 + hash(seed + depth + x) * 0.20;
+                    branch(ex, ey, len * 0.72, angle - spread, depth + 1);
+                    branch(ex, ey, len * 0.70, angle + spread, depth + 1);
+                }
+
+                branch(wx, wy, treeH * 0.44, -Math.PI * 0.5 + (hash(seed) - 0.5) * 0.22, 1);
+            });
+        }
+
+        // ==============================================================
+        // 6. 5 DISTINCT ARCHITECTURAL HOUSE STYLES (Nestled in Terrain)
+        // ==============================================================
+        function paintRandomHouseCompound(wx, wy, scale, seed) {
+            const style = Math.floor(Math.random() * 5);
+
+            paintOrganicBoulder(wx - 18 * scale, wy + 4 * scale, 22 * scale, 8 * scale, seed + 1);
+            paintOrganicBoulder(wx + 18 * scale, wy + 5 * scale, 24 * scale, 9 * scale, seed + 2);
+
+            drawInWorld(wx - 75 * scale, wx + 75 * scale, (cCtx) => {
+                cCtx.lineCap = 'round';
+                cCtx.lineJoin = 'round';
+
+                if (style === 0) {
+                    // STYLE 0: Two-Tiered Classical Shan Shui Pavilion (飞檐楼阁)
+                    const pw = 42 * scale;
+                    const ph = 36 * scale;
+                    const upEaveY = wy - ph * 0.58;
+                    const lowEaveY = wy - ph * 0.28;
+                    const peakY = wy - ph;
+
+                    cCtx.fillStyle = '#e6dbc4';
+                    cCtx.fillRect(wx - pw * 0.38, lowEaveY, pw * 0.76, wy - lowEaveY);
+                    cCtx.fillRect(wx - pw * 0.28, upEaveY, pw * 0.56, lowEaveY - upEaveY);
+
+                    cCtx.fillStyle = rgbaStr(PALETTE.goldLeaf, 0.42);
+                    cCtx.fillRect(wx - pw * 0.20, lowEaveY + 3 * scale, pw * 0.40, (wy - lowEaveY) * 0.55);
+
+                    cCtx.fillStyle = rgbaStr(PALETTE.inkMid, 0.34);
+                    cCtx.beginPath();
+                    cCtx.moveTo(wx - pw * 0.54, upEaveY - 3.5 * scale);
+                    cCtx.quadraticCurveTo(wx - pw * 0.18, upEaveY, wx, peakY);
+                    cCtx.quadraticCurveTo(wx + pw * 0.18, upEaveY, wx + pw * 0.54, upEaveY - 3.5 * scale);
+                    cCtx.closePath();
+                    cCtx.fill();
+
+                    cCtx.strokeStyle = rgbaStr(PALETTE.inkDark, 0.92);
+                    cCtx.lineWidth = 1.65 * scale;
+                    cCtx.stroke();
+
+                    cCtx.beginPath();
+                    cCtx.moveTo(wx - pw * 0.66, lowEaveY - 3 * scale);
+                    cCtx.quadraticCurveTo(wx - pw * 0.28, lowEaveY + 1, wx - pw * 0.24, upEaveY);
+                    cCtx.lineTo(wx + pw * 0.24, upEaveY);
+                    cCtx.quadraticCurveTo(wx + pw * 0.28, lowEaveY + 1, wx + pw * 0.66, lowEaveY - 3 * scale);
+                    cCtx.closePath();
+                    cCtx.fill();
+                    cCtx.stroke();
+
+                    cCtx.strokeStyle = rgbaStr(PALETTE.inkDark, 0.86);
+                    cCtx.lineWidth = 1.3 * scale;
+                    [-0.34, -0.12, 0.12, 0.34].forEach(cf => {
+                        cCtx.beginPath();
+                        cCtx.moveTo(wx + pw * cf, lowEaveY);
+                        cCtx.lineTo(wx + pw * cf, wy);
+                        cCtx.stroke();
+                    });
+
+                } else if (style === 1) {
+                    // STYLE 1: Steep Alpine Timber & Stone Chalet (高山木屋)
+                    const w = 38 * scale;
+                    const h = 30 * scale;
+                    const peakY = wy - h;
+
+                    cCtx.fillStyle = '#e6dbc4';
+                    cCtx.beginPath();
+                    cCtx.moveTo(wx - w * 0.52, wy);
+                    cCtx.lineTo(wx, peakY);
+                    cCtx.lineTo(wx + w * 0.52, wy);
+                    cCtx.closePath();
+                    cCtx.fill();
+
+                    cCtx.fillStyle = rgbaStr(PALETTE.ochreWarm, 0.30);
+                    cCtx.fill();
+
+                    cCtx.strokeStyle = rgbaStr(PALETTE.inkMid, 0.60);
+                    cCtx.lineWidth = 0.8 * scale;
+                    for (let y = wy - 3 * scale; y > peakY + 6 * scale; y -= 3.5 * scale) {
+                        const frac = (y - peakY) / h;
+                        const halfW = (w * 0.50) * frac;
+                        cCtx.beginPath();
+                        cCtx.moveTo(wx - halfW, y);
+                        cCtx.lineTo(wx + halfW, y);
+                        cCtx.stroke();
+                    }
+
+                    cCtx.fillStyle = rgbaStr(PALETTE.goldLeaf, 0.68);
+                    cCtx.fillRect(wx - 6 * scale, wy - 11 * scale, 4.5 * scale, 4.5 * scale);
+                    cCtx.fillRect(wx + 1.5 * scale, wy - 11 * scale, 4.5 * scale, 4.5 * scale);
+                    cCtx.strokeStyle = rgbaStr(PALETTE.inkDark, 0.88);
+                    cCtx.lineWidth = 0.9 * scale;
+                    cCtx.strokeRect(wx - 6 * scale, wy - 11 * scale, 4.5 * scale, 4.5 * scale);
+                    cCtx.strokeRect(wx + 1.5 * scale, wy - 11 * scale, 4.5 * scale, 4.5 * scale);
+
+                    cCtx.lineWidth = 2.0 * scale;
+                    cCtx.beginPath();
+                    cCtx.moveTo(wx - w * 0.58, wy + 1);
+                    cCtx.lineTo(wx, peakY);
+                    cCtx.lineTo(wx + w * 0.58, wy + 1);
+                    cCtx.stroke();
+
+                } else if (style === 2) {
+                    // STYLE 2: Riverside Stilt Pavilion & Veranda (水榭吊脚楼)
+                    const w = 38 * scale;
+                    const h = 17 * scale;
+                    const stiltH = 10 * scale;
+                    const deckY = wy - stiltH;
+                    const eaveY = deckY - h;
+                    const peakY = eaveY - 10 * scale;
+
+                    cCtx.strokeStyle = rgbaStr(PALETTE.inkDark, 0.88);
+                    cCtx.lineWidth = 1.5 * scale;
+                    [-0.40, -0.14, 0.14, 0.40].forEach(pf => {
+                        const px = wx + w * pf;
+                        cCtx.beginPath();
+                        cCtx.moveTo(px, deckY);
+                        cCtx.lineTo(px, wy + 4 * scale);
+                        cCtx.stroke();
+                    });
+
+                    cCtx.fillStyle = '#e6dbc4';
+                    cCtx.fillRect(wx - w * 0.40, eaveY, w * 0.72, h);
+
+                    cCtx.fillStyle = rgbaStr(PALETTE.ochreWarm, 0.36);
+                    cCtx.beginPath();
+                    cCtx.moveTo(wx - w * 0.54, eaveY);
+                    cCtx.lineTo(wx - w * 0.10, peakY);
+                    cCtx.lineTo(wx + w * 0.16, peakY);
+                    cCtx.lineTo(wx + w * 0.44, eaveY);
+                    cCtx.closePath();
+                    cCtx.fill();
+
+                    cCtx.strokeStyle = rgbaStr(PALETTE.inkDark, 0.90);
+                    cCtx.lineWidth = 1.6 * scale;
+                    cCtx.stroke();
+                    cCtx.strokeRect(wx - w * 0.40, eaveY, w * 0.72, h);
+
+                    cCtx.beginPath();
+                    cCtx.moveTo(wx - w * 0.48, deckY);
+                    cCtx.lineTo(wx + w * 0.62, deckY);
+                    cCtx.stroke();
+
+                } else if (style === 3) {
+                    // STYLE 3: Rustic Thatched Hermitage Cottage (田园茅舍)
+                    const w = 38 * scale;
+                    const wallH = 14 * scale;
+                    const roofH = 14 * scale;
+                    const eaveY = wy - wallH;
+                    const peakY = eaveY - roofH;
+
+                    cCtx.fillStyle = '#e6dbc4';
+                    cCtx.fillRect(wx - w * 0.42, eaveY, w * 0.84, wallH);
+                    cCtx.strokeStyle = rgbaStr(PALETTE.inkDark, 0.86);
+                    cCtx.lineWidth = 1.3 * scale;
+                    cCtx.strokeRect(wx - w * 0.42, eaveY, w * 0.84, wallH);
+
+                    cCtx.fillStyle = rgbaStr(PALETTE.ochreWarm, 0.40);
+                    cCtx.beginPath();
+                    cCtx.moveTo(wx - w * 0.54, eaveY + 1);
+                    cCtx.quadraticCurveTo(wx - w * 0.28, peakY, wx, peakY);
+                    cCtx.quadraticCurveTo(wx + w * 0.28, peakY, wx + w * 0.54, eaveY + 1);
+                    cCtx.closePath();
+                    cCtx.fill();
+                    cCtx.lineWidth = 1.7 * scale;
+                    cCtx.stroke();
+
+                    cCtx.lineWidth = 0.7 * scale;
+                    for (let t = -4; t <= 4; t++) {
+                        cCtx.beginPath();
+                        cCtx.moveTo(wx + t * 2 * scale, peakY + 2 * scale);
+                        cCtx.lineTo(wx + t * 4 * scale, eaveY);
+                        cCtx.stroke();
+                    }
+
+                } else {
+                    // STYLE 4: Classical Courtyard Compound (山居院落)
+                    const w = 44 * scale;
+                    const wallH = 13 * scale;
+                    const eaveY = wy - wallH;
+                    const peakY = eaveY - 12 * scale;
+
+                    cCtx.fillStyle = '#e6dbc4';
+                    cCtx.fillRect(wx - w * 0.45, eaveY, w * 0.65, wallH);
+                    cCtx.fillRect(wx + w * 0.12, eaveY + 3 * scale, w * 0.38, wallH - 3 * scale);
+
+                    cCtx.strokeStyle = rgbaStr(PALETTE.inkDark, 0.88);
+                    cCtx.lineWidth = 1.3 * scale;
+                    cCtx.strokeRect(wx - w * 0.45, eaveY, w * 0.65, wallH);
+                    cCtx.strokeRect(wx + w * 0.12, eaveY + 3 * scale, w * 0.38, wallH - 3 * scale);
+
+                    cCtx.fillStyle = rgbaStr(PALETTE.inkMid, 0.32);
+                    cCtx.beginPath();
+                    cCtx.moveTo(wx - w * 0.52, eaveY);
+                    cCtx.lineTo(wx - w * 0.12, peakY);
+                    cCtx.lineTo(wx + w * 0.26, eaveY);
+                    cCtx.closePath();
+                    cCtx.fill();
+                    cCtx.stroke();
+                }
+            });
+        }
+
+        // ==============================================================
+        // 7. WATER WITH CURLED SWIRLS & FLOWING CURRENTS
+        // ==============================================================
+        function paintWaterSwirlAndCurrents(cx, cy, radius, dir) {
+            const pts = [];
+            const steps = 28;
+            const maxAngle = Math.PI * 2.9;
+
+            for (let i = 0; i <= steps; i++) {
+                const t = i / steps;
+                const angle = t * maxAngle * dir;
+                const r = radius * Math.pow(t, 0.86);
+                pts.push({
+                    x: cx + Math.cos(angle) * r,
+                    y: cy + Math.sin(angle) * (r * 0.32)
+                });
+            }
+
+            paintSplineStroke(pts, {
+                width: 1.3,
+                color: PALETTE.inkMid,
+                alpha: 0.48,
+                dry: true,
+                bristles: 2
+            });
+
+            for (let w = -1; w <= 1; w += 2) {
+                const wy = cy + w * radius * 0.30;
+                paintStroke(cx - radius * 2.4, wy, cx + radius * 2.4, wy + w * 2, {
+                    width: 0.95,
+                    color: PALETTE.inkLight,
+                    alpha: 0.42,
+                    curve: w * 4,
+                    dry: true
+                });
+            }
+        }
+
+        // ==============================================================
+        // LEAD-OFFSET PAINTER'S ALGORITHM
+        // ==============================================================
+        let artistWorldX = 0;
+        let cameraX = 0;
+        let nextDistantRangeX = 240;
+        let nextCloudX = 120;
+        let nextMidMassifX = 280;
+        let nextSubMassifX = 180;
+        let nextWaterWaveX = 40;
+        let nextSpitX = 200;
+
+        function resetAll() {
+            chunks = {};
+            artistWorldX = 0;
+            cameraX = 0;
+            nextDistantRangeX = 240;
+            nextCloudX = 120;
+            nextMidMassifX = 280;
+            nextSubMassifX = 180;
+            nextWaterWaveX = 40;
+            nextSpitX = 200;
+            buildPaperTexture();
+        }
+
+        function advanceArtist(deltaX) {
+            artistWorldX += deltaX;
+            const wx = artistWorldX;
+
+            // Layer 0 (Lead +550px): Wide Distant Misty Mountain Ranges & Clouds
+            const wxFar = wx + 550;
+            if (wxFar >= nextDistantRangeX) {
+                const seed = nextDistantRangeX * 0.91 + 7.3;
+                const rWidth = 650 + hash(seed) * 380;
+                const rHeight = height * (0.14 + hash(seed * 2.3) * 0.10);
+                const topY = height * (0.22 + hash(seed * 3.7) * 0.08);
+                paintDistantWashRange(nextDistantRangeX, topY, rWidth, rHeight, seed);
+                nextDistantRangeX += rWidth * 0.62;
+            }
+
+            if (wxFar >= nextCloudX) {
+                const cy = height * (0.08 + Math.random() * 0.14);
+                const cLen = 160 + Math.random() * 200;
+                paintStroke(nextCloudX - cLen * 0.5, cy, nextCloudX + cLen * 0.5, cy + (Math.random() - 0.5) * 6, {
+                    width: 12 + Math.random() * 12,
+                    color: PALETTE.chalkWhite,
+                    alpha: 0.24,
+                    bleed: true,
+                    curve: -6
+                });
+
+                if (Math.random() < 0.50) {
+                    const numBirds = 2 + Math.floor(Math.random() * 4);
+                    for (let b = 0; b < numBirds; b++) {
+                        const bx = nextCloudX + b * 22 + (Math.random() - 0.5) * 10;
+                        const by = cy + 14 + Math.sin(b * 1.4) * 10;
+                        const span = 5.0 + Math.random() * 3.0;
+                        paintStroke(bx - span, by - span * 0.4, bx, by, { width: 1.1, color: PALETTE.inkDark, alpha: 0.72, curve: -1.5 });
+                        paintStroke(bx, by, bx + span, by - span * 0.4, { width: 1.1, color: PALETTE.inkDark, alpha: 0.72, curve: -1.5 });
+                    }
+                }
+                nextCloudX += 240 + Math.random() * 260;
+            }
+
+            // Layer 1 (Lead +360px): Sprawling, Broad Realistic Mountain Massifs
+            // Wide base (640px to 960px wide!) vs moderate height so they never look like narrow pillars!
+            const wxMid = wx + 360;
+            if (wxMid >= nextMidMassifX) {
+                const seed = nextMidMassifX * 1.37;
+                const clusterW = 640 + hash(seed) * 320;
+                const clusterH = height * (0.26 + hash(seed * 2.1) * 0.15);
+                const peakY = height * (0.14 + hash(seed * 3.7) * 0.12);
+
+                paintMountainCluster(nextMidMassifX, peakY, clusterW, clusterH, seed);
+
+                // Leave natural valley/lake breathing room between major mountain ranges
+                nextMidMassifX += clusterW * (0.68 + Math.random() * 0.35);
+            }
+
+            // Layer 2 (Lead +180px): Broad Rolling Foothill Slopes, Groves & Foothill Houses
+            const wxSub = wx + 180;
+            if (wxSub >= nextSubMassifX) {
+                const seed = nextSubMassifX * 2.71 + 19.3;
+                const mWidth = 380 + hash(seed) * 220;
+                const mHeight = height * (0.13 + hash(seed * 1.9) * 0.08);
+                const peakY = height * (0.48 + hash(seed * 2.9) * 0.08);
+
+                paintRealisticMountainMassif(nextSubMassifX, peakY, mWidth, mHeight, seed, PALETTE.ochreWarm);
+                paintOrganicBoulder(nextSubMassifX - mWidth * 0.28, peakY + mHeight * 0.94, 26, 10, seed);
+                paintOrganicBoulder(nextSubMassifX + mWidth * 0.25, peakY + mHeight * 0.96, 30, 11, seed + 1);
+
+                if (hash(seed * 7.7) > 0.28) {
+                    paintLeafyGroveTree(nextSubMassifX - mWidth * 0.16, peakY + mHeight * 0.86, 36 + hash(seed) * 18, seed);
+                }
+
+                if (hash(seed * 8.3) > 0.32) {
+                    const houseX = nextSubMassifX + (hash(seed * 4.2) > 0.5 ? 1 : -1) * (mWidth * 0.18);
+                    const houseY = peakY + mHeight * 0.93;
+                    paintRandomHouseCompound(houseX, houseY, 0.95 + hash(seed) * 0.22, seed);
+                }
+
+                nextSubMassifX += mWidth * (0.65 + Math.random() * 0.35);
+            }
+
+            // Layer 3 (Lead +50px): Lake Water Ripples & Curled Eddy Swirls
+            const wxWater = wx + 50;
+            if (wxWater >= nextWaterWaveX) {
+                const wy = height * (0.60 + Math.random() * 0.34);
+                const waveLen = 75 + Math.random() * 110;
+
+                paintStroke(nextWaterWaveX - waveLen * 0.5, wy, nextWaterWaveX + waveLen * 0.5, wy, {
+                    width: 0.9,
+                    color: PALETTE.inkMid,
+                    alpha: 0.34,
+                    curve: (Math.random() - 0.5) * 3,
+                    dry: true
+                });
+
+                if (wy > height * 0.68 && Math.random() < 0.35) {
+                    const swirlR = 14 + Math.random() * 22;
+                    paintWaterSwirlAndCurrents(nextWaterWaveX, wy, swirlR, Math.random() < 0.5 ? 1 : -1);
+                }
+
+                nextWaterWaveX += 32 + Math.random() * 38;
+            }
+
+            // Layer 4 (At wx): Foreground Earthen Spits, Boulders, Master Pines & Houses
+            if (wx >= nextSpitX) {
+                const seed = nextSpitX * 3.14 + 51.7;
+                const groundY = height * (0.82 + (hash(seed) - 0.5) * 0.04);
+                const spitW = 210 + hash(seed * 2.1) * 120;
+
+                for (let s = 0; s < 5; s++) {
+                    paintStroke(
+                        nextSpitX - spitW * (0.65 - s * 0.08), groundY + 18 - s * 3.5,
+                        nextSpitX + spitW * (0.65 - s * 0.08), groundY + 18 - s * 3.5,
+                        { width: 1.4, color: s === 0 ? PALETTE.ochreWarm : PALETTE.inkMid, alpha: 0.62, curve: -10, dry: true }
+                    );
+                }
+
+                paintOrganicBoulder(nextSpitX - 68, groundY + 5, 28, 11, seed + 1);
+                paintOrganicBoulder(nextSpitX - 15, groundY + 3, 36, 13, seed + 2);
+                paintOrganicBoulder(nextSpitX + 40, groundY + 5, 32, 12, seed + 3);
+                paintOrganicBoulder(nextSpitX + 92, groundY + 7, 25, 9, seed + 4);
+
+                const treeH = 76 + hash(seed * 4.3) * 38;
+                const mainLean = hash(seed * 2.1) > 0.5 ? 0.85 : -0.85;
+                paintMasterPineTree(nextSpitX - 24, groundY - 2, treeH, mainLean * 0.45, seed);
+                paintMasterPineTree(nextSpitX + 20, groundY - 4, treeH * 0.84, mainLean * 0.95, seed + 5);
+                paintLeafyGroveTree(nextSpitX + 56, groundY, treeH * 0.72, seed + 9);
+                paintLeafyGroveTree(nextSpitX - 56, groundY + 2, treeH * 0.64, seed + 14);
+
+                if (hash(seed * 9.1) > 0.32) {
+                    paintRandomHouseCompound(nextSpitX + 108, groundY + 3, 1.0, seed + 12);
+                }
+
+                nextSpitX += 360 + Math.random() * 220;
+            }
+        }
+
+        // ==============================================================
+        // MAIN DISPLAY LOOP & SCROLL CONTROLLER
+        // ==============================================================
+        function render() {
+            if (isRunning) {
+                const deltaX = 3.5 * drawSpeed;
+                advanceArtist(deltaX);
+
+                // Starts at x = 0 on left, progresses right; once reaching right edge, scrolls left!
+                if (artistWorldX < width) {
+                    cameraX = 0;
+                } else {
+                    cameraX = artistWorldX - width;
+                }
+            }
+
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.scale(dpr, dpr);
+
+            const startChunk = Math.floor(cameraX / CHUNK_WIDTH);
+            const endChunk   = Math.floor((cameraX + width) / CHUNK_WIDTH);
+
+            for (let c = startChunk; c <= endChunk; c++) {
+                const chunkCanvas = getChunk(c);
+                const drawX = c * CHUNK_WIDTH - cameraX;
+                ctx.drawImage(chunkCanvas, drawX, 0);
+            }
+
+            requestAnimationFrame(render);
+        }
+
+        function resize() {
+            width = window.innerWidth;
+            height = window.innerHeight;
+            canvas.width = Math.floor(width * dpr);
+            canvas.height = Math.floor(height * dpr);
+            canvas.style.width = width + 'px';
+            canvas.style.height = height + 'px';
+            ctx.scale(dpr, dpr);
+
+            buildPaperTexture();
+        }
+        window.addEventListener('resize', resize);
+
+        btnPause.addEventListener('click', () => {
+            isRunning = !isRunning;
+            btnPause.textContent = isRunning ? 'Pause' : 'Resume';
+        });
+
+        btnReset.addEventListener('click', () => {
+            resetAll();
+        });
+
+        rngSpeed.addEventListener('input', (e) => {
+            drawSpeed = parseFloat(e.target.value);
+        });
+
+        rngLead.addEventListener('input', (e) => {
+            pigmentRichness = parseFloat(e.target.value);
+        });
+
+        // Initialize & Run
+        resize();
+        render();
+    </script>
+</body>
+</html>
